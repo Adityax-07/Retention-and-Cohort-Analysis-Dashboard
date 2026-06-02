@@ -77,10 +77,19 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── Guard ─────────────────────────────────────────────────────────────────────
+# ── Auto-ingest on first run (Hugging Face Spaces / fresh clone) ───────────────
 if not os.path.exists(DB_PATH):
-    st.error("**retail.db not found.** Run `python ingest_data.py` first.", icon="🚫")
-    st.stop()
+    import subprocess
+    with st.spinner("First run — downloading & processing UCI dataset (~2–3 min)..."):
+        result = subprocess.run(
+            ["python", os.path.join(os.path.dirname(os.path.abspath(__file__)), "ingest_data.py")],
+            capture_output=True,
+            text=True,
+        )
+    if result.returncode != 0:
+        st.error(f"Data ingestion failed:\n\n```\n{result.stderr[-2000:]}\n```")
+        st.stop()
+    st.rerun()
 
 
 # ── Cached data loaders ────────────────────────────────────────────────────────
