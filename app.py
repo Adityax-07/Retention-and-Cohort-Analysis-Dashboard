@@ -1,6 +1,6 @@
 """
 Retention & Cohort Analysis Dashboard — Online Retail II (UCI)
-Part 5: 3-tab Streamlit app · country filter · dark/blue theme
+Three-tab Streamlit app with country filtering and complete-month cohorts
 
 Run once:  python ingest_data.py
 Launch:    streamlit run app.py
@@ -8,6 +8,7 @@ Launch:    streamlit run app.py
 
 import os
 import sqlite3
+import sys
 
 import duckdb
 import pandas as pd
@@ -82,9 +83,10 @@ if not os.path.exists(DB_PATH):
     import subprocess
     with st.spinner("First run — downloading & processing UCI dataset (~2–3 min)..."):
         result = subprocess.run(
-            ["python", os.path.join(os.path.dirname(os.path.abspath(__file__)), "ingest_data.py")],
+            [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ingest_data.py")],
             capture_output=True,
             text=True,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
         )
     if result.returncode != 0:
         st.error(f"Data ingestion failed:\n\n```\n{result.stderr[-2000:]}\n```")
@@ -108,7 +110,8 @@ def get_countries(db_path: str) -> list[str]:
 @st.cache_data(show_spinner=False)
 def get_db_stats(db_path: str, country: str) -> dict:
     con   = sqlite3.connect(db_path)
-    where = "" if country == "All Countries" else f"WHERE Country = '{country}'"
+    where = "" if country == "All Countries" else "WHERE Country = ?"
+    params = () if country == "All Countries" else (country,)
     row   = con.execute(f"""
         SELECT
             COUNT(*)                        AS n_rows,
@@ -118,29 +121,45 @@ def get_db_stats(db_path: str, country: str) -> dict:
             MIN(SUBSTR(InvoiceDate, 1, 7))  AS min_month,
             MAX(SUBSTR(InvoiceDate, 1, 7))  AS max_month
         FROM transactions {where}
-    """).fetchone()
+    """, params).fetchone()
     con.close()
     return dict(zip(["n_rows", "n_customers", "n_invoices", "total_revenue", "min_month", "max_month"], row))
 
 
 @st.cache_data(show_spinner=False)
+def get_analysis_cutoff(db_path: str) -> str:
+    """First day of the last complete month in the source dataset."""
+    with sqlite3.connect(db_path) as con:
+        last_date = pd.Timestamp(con.execute(
+            "SELECT MAX(InvoiceDate) FROM transactions"
+        ).fetchone()[0])
+    last_month = last_date.to_period("M")
+    if last_date.normalize() != last_month.end_time.normalize():
+        last_month -= 1
+    return str(last_month.start_time.date())
+
+
+@st.cache_data(show_spinner=False)
 def run_cohort_analysis(
-    db_path: str, country: str
+    db_path: str, country: str, cutoff: str
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Filter orders by country, run the 6-CTE DuckDB cohort pipeline."""
+    """Analyze purchases in the selected country through the last full month."""
     con_sq = sqlite3.connect(db_path)
     if country == "All Countries":
-        orders_df = pd.read_sql_query("SELECT * FROM orders", con_sq)
+        orders_df = pd.read_sql_query(
+            "SELECT * FROM orders WHERE order_date < DATE(?, '+1 month')",
+            con_sq, params=[cutoff],
+        )
     else:
         orders_df = pd.read_sql_query(
             """
-            SELECT o.order_id, o.customer_id, o.order_date, o.revenue
-            FROM   orders o
-            WHERE  o.customer_id IN (
-                SELECT DISTINCT CustomerID FROM transactions WHERE Country = ?
-            )
+            SELECT InvoiceNo AS order_id, CustomerID AS customer_id,
+                   DATE(InvoiceDate) AS order_date, SUM(Revenue) AS revenue
+            FROM transactions
+            WHERE Country = ? AND InvoiceDate < DATE(?, '+1 month')
+            GROUP BY InvoiceNo, CustomerID, DATE(InvoiceDate)
             """,
-            con_sq, params=[country],
+            con_sq, params=[country, cutoff],
         )
     con_sq.close()
 
@@ -149,6 +168,8 @@ def run_cohort_analysis(
 
     con = duckdb.connect()
     con.register("orders_raw", orders_df)
+    con.execute("CREATE TABLE analysis_window (last_complete_month DATE)")
+    con.execute("INSERT INTO analysis_window VALUES (?)", [cutoff])
     con.execute("""
         CREATE TABLE orders AS
         SELECT order_id, customer_id,
@@ -187,19 +208,20 @@ with st.sidebar:
     st.markdown("### Dataset")
 
     stats = get_db_stats(DB_PATH, country)
-    st.metric("Transactions",  f"{stats['n_rows']:,}")
+    st.metric("Cleaned line items",  f"{stats['n_rows']:,}")
     st.metric("Customers",     f"{stats['n_customers']:,}")
     st.metric("Invoices",      f"{stats['n_invoices']:,}")
     st.metric("Revenue",       f"£{stats['total_revenue']:,.0f}")
-    st.caption(f"Period: {stats['min_month']} to {stats['max_month']}")
+    st.caption(f"Source period: {stats['min_month']} to {stats['max_month']}")
 
     st.divider()
     st.caption("UCI Online Retail II  ·  DuckDB + Streamlit")
 
 
 # ── Load cohort data ───────────────────────────────────────────────────────────
+analysis_cutoff = get_analysis_cutoff(DB_PATH)
 with st.spinner(f"Running cohort analysis for {country} ..."):
-    retention_df, avg_df, summary_df = run_cohort_analysis(DB_PATH, country)
+    retention_df, avg_df, summary_df = run_cohort_analysis(DB_PATH, country, analysis_cutoff)
 
 if retention_df.empty:
     st.warning(f"No cohort data for **{country}**. Choose a different country.")
@@ -214,7 +236,7 @@ st.markdown("# Retention & Cohort Analysis Dashboard")
 st.caption(
     f"Online Retail II (UCI)  ·  {country}  ·  "
     f"{n_cohorts} cohorts  ·  "
-    f"{stats['min_month']} – {stats['max_month']}  ·  "
+    f"Complete months through {analysis_cutoff[:7]}  ·  "
     f"{stats['n_customers']:,} customers"
 )
 st.divider()
@@ -291,14 +313,14 @@ with tab1:
         font=dict(color="#e6edf3"),
         margin=dict(l=110, r=110, t=70, b=60),
     )
-    st.plotly_chart(fig_heat, use_container_width=True)
+    st.plotly_chart(fig_heat, width="stretch")
 
     with st.expander("Raw data table"):
         raw_pivot = pivot.copy().round(1)
         raw_pivot.columns = [f"M{int(c)}" for c in raw_pivot.columns]
         st.dataframe(
             raw_pivot.style.background_gradient(cmap="Reds", axis=None).format("{:.1f}", na_rep="—"),
-            use_container_width=True,
+            width="stretch",
         )
 
 
@@ -310,7 +332,7 @@ with tab2:
     st.markdown("### Retention Curves by Cohort")
     st.caption(
         "Compare acquisition cohorts side-by-side. "
-        "Orange dashed line = 20% e-commerce benchmark."
+        "The dashed line shows the average of cohorts observed at each month."
     )
 
     default_selection = cohort_months[:10] if n_cohorts >= 10 else cohort_months
@@ -324,11 +346,10 @@ with tab2:
     if not selected:
         st.info("Select at least one cohort month above.")
     else:
-        # Best / worst by avg M1–M12 retention (across ALL cohorts, not just selected)
+        # Compare cohorts at the same observed age (M3).
         avg_m1plus = (
-            retention_df[retention_df["period_number"] >= 1]
-            .groupby("cohort_month")["retention_rate"]
-            .mean()
+            retention_df[retention_df["period_number"] == 3]
+            .set_index("cohort_month")["retention_rate"]
             .dropna()
         )
         best_cohort  = avg_m1plus.idxmax() if not avg_m1plus.empty else None
@@ -361,13 +382,12 @@ with tab2:
                 hovertemplate=f"Cohort {cohort}<br>M%{{x}}: %{{y:.1f}}%<extra></extra>",
             ))
 
-        fig_curves.add_hline(
-            y=20,
-            line_dash="dash", line_color="#f0883e", line_width=1.8,
-            annotation_text="  e-commerce benchmark (20%)",
-            annotation_position="bottom right",
-            annotation_font=dict(size=11, color="#f0883e"),
-        )
+        fig_curves.add_trace(go.Scatter(
+            x=avg_df["period_number"], y=avg_df["avg_retention_rate"],
+            mode="lines", name="Observed cohort average",
+            line=dict(color="#f0883e", width=2, dash="dash"),
+            hovertemplate="M%{x}: %{y:.1f}%<extra></extra>",
+        ))
 
         fig_curves.update_layout(
             title=dict(text="Cohort Retention Curves", font=dict(size=17, color="#e6edf3"), x=0.5, xanchor="center"),
@@ -385,13 +405,13 @@ with tab2:
             font=dict(color="#e6edf3"),
             margin=dict(l=75, r=200, t=70, b=70),
         )
-        st.plotly_chart(fig_curves, use_container_width=True)
+        st.plotly_chart(fig_curves, width="stretch")
 
         # Quick-reference table for the selected cohorts
         if not summary_df.empty:
             sel_summary = (
                 summary_df[summary_df["cohort_month"].isin(selected)]
-                [["cohort_month","cohort_size","m1_retention","m3_retention","m6_retention","ltv_per_customer"]]
+                [["cohort_month","cohort_size","m1_retention","m3_retention","m6_retention","m6_revenue_per_customer"]]
                 .sort_values("cohort_month")
                 .rename(columns={
                     "cohort_month":   "Cohort",
@@ -399,224 +419,151 @@ with tab2:
                     "m1_retention":   "M1 %",
                     "m3_retention":   "M3 %",
                     "m6_retention":   "M6 %",
-                    "ltv_per_customer": "LTV / Customer (£)",
+                    "m6_revenue_per_customer": "M0–M6 Revenue / Customer (£)",
                 })
             )
             st.dataframe(
                 sel_summary.set_index("Cohort").round(1).style.format(
-                    {"LTV / Customer (£)": "£{:,.0f}", "M1 %": "{:.1f}", "M3 %": "{:.1f}", "M6 %": "{:.1f}"},
+                    {"M0–M6 Revenue / Customer (£)": "£{:,.0f}", "M1 %": "{:.1f}", "M3 %": "{:.1f}", "M6 %": "{:.1f}"},
                     na_rep="—",
                 ),
-                use_container_width=True,
+                width="stretch",
             )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TAB 3 — BUSINESS INSIGHTS
-# Metric cards · Analyst Recommendations · Business Narrative (Part 6)
+# Age-matched cohort metrics and testable business recommendations
 # ─────────────────────────────────────────────────────────────────────────────
 with tab3:
     st.markdown("### Business Insights")
+    st.caption(
+        "Cohorts are compared at the same age. M3 retention needs four complete "
+        "months of observation; M0–M6 revenue per customer needs seven."
+    )
 
-    # ── Pre-compute values for all sections ──────────────────────────────────
-    m3_vals     = summary_df["m3_retention"].dropna()
-    avg_m3      = m3_vals.mean()
-    best_row    = summary_df.loc[m3_vals.idxmax()]
-    worst_row   = summary_df.loc[m3_vals.idxmin()]
-    best_cohort_str  = best_row["cohort_month"]
-    worst_cohort_str = worst_row["cohort_month"]
+    m3 = summary_df.dropna(subset=["m3_retention"]).copy()
+    m6 = summary_df.dropna(subset=["m6_revenue_per_customer"]).copy()
+    m1_rows = retention_df[retention_df["period_number"] == 1].copy()
 
-    avg_m1_ret  = avg_df[avg_df["period_number"] == 1]["avg_retention_rate"].values
-    avg_m1      = float(avg_m1_ret[0]) if len(avg_m1_ret) else 22.0
-    avg_m6_ret  = avg_df[avg_df["period_number"] == 6]["avg_retention_rate"].values
-    avg_m6      = float(avg_m6_ret[0]) if len(avg_m6_ret) else 14.0
-    m1_dropoff  = 100.0 - avg_m1
-
-    avg_ltv     = summary_df["ltv_per_customer"].mean()
-    best_ltv    = best_row["ltv_per_customer"]
-    best_m3     = best_row["m3_retention"]
-    worst_m3    = worst_row["m3_retention"]
-    multiplier  = best_m3 / avg_m3 if avg_m3 > 0 else 0
-
-    # Best cohort ARPU at M1 (revenue per active buyer) for the narrative
-    best_arpu_m1_vals = retention_df[
-        (retention_df["cohort_month"] == best_cohort_str) &
-        (retention_df["period_number"] == 1)
-    ]["arpu"].values
-    other_arpu_m1_vals = retention_df[
-        (retention_df["cohort_month"] != best_cohort_str) &
-        (retention_df["period_number"] == 1)
-    ]["arpu"].dropna().values
-    best_m1_arpu  = float(best_arpu_m1_vals[0])  if len(best_arpu_m1_vals)  else 1173
-    other_m1_arpu = float(other_arpu_m1_vals.mean()) if len(other_arpu_m1_vals) else 490
-
-    # £42K incremental revenue estimate
-    avg_cohort_size     = int(summary_df["cohort_size"].mean())
-    non_best_avg_size   = int(summary_df[summary_df["cohort_month"] != best_cohort_str]["cohort_size"].mean())
-    additional_retained = int(non_best_avg_size * (m1_dropoff / 100) * 0.05)
-    incremental_arpu    = min(other_m1_arpu, 450)
-    annual_revenue_lift = additional_retained * incremental_arpu * 12
-    annual_revenue_lift = max(annual_revenue_lift, 42_000)   # floor at the published figure
-
-    # ── Metric cards ──────────────────────────────────────────────────────────
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric(
-            "Best Cohort  (M3 Retention)",
-            best_cohort_str,
-            delta=f"{best_m3:.1f}% vs {avg_m3:.1f}% avg",
+    if len(m3) < 2:
+        st.info(
+            "There are fewer than two cohorts with an observed M3 in this selection. "
+            "Choose a larger country or All Countries for a reliable comparison."
         )
-    with c2:
-        st.metric(
-            "Worst Cohort  (M3 Retention)",
-            worst_cohort_str,
-            delta=f"{worst_m3:.1f}% at M3",
-            delta_color="inverse",
-        )
-    with c3:
-        st.metric(
-            "Avg Month-3 Retention",
-            f"{avg_m3:.1f}%",
-            delta=f"across {len(m3_vals)} cohorts",
-            delta_color="off",
+    else:
+        best = m3.loc[m3["m3_retention"].idxmax()]
+        worst = m3.loc[m3["m3_retention"].idxmin()]
+        avg_m3 = m3["m3_retention"].mean()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Highest M3 retention", best["cohort_month"],
+                  f"{best['m3_retention']:.1f}%")
+        c2.metric("Lowest M3 retention", worst["cohort_month"],
+                  f"{worst['m3_retention']:.1f}%")
+        c3.metric("Mean M3 retention", f"{avg_m3:.1f}%",
+                  f"{len(m3)} observed cohorts")
+
+        st.markdown(
+            f"**Finding:** {best['cohort_month']} has the highest M3 retention "
+            f"({best['m3_retention']:.1f}%) among {len(m3)} eligible cohorts. "
+            "This is an association with acquisition month, not evidence of a "
+            "particular marketing channel or customer intent."
         )
 
-    st.divider()
-
-    # ── Analyst Recommendations ───────────────────────────────────────────────
-    st.markdown("## Analyst Recommendations")
-
-    col_r1, col_r2, col_r3 = st.columns(3)
-
-    with col_r1:
-        st.info(f"""
-**1 — 30-Day Win-Back Sequence**
-
-{m1_dropoff:.0f}% of new customers never return after their first order — the single
-largest revenue leakage point. A Day-7 / Day-14 / Day-28 personalised email series
-triggered by first-purchase product category could recapture 5–10% of churned buyers.
-
-**Estimated lift:** ~{additional_retained} additional retained customers per cohort ×
-£{incremental_arpu:,.0f} avg M1 spend × 12 cohorts/year =
-**£{annual_revenue_lift:,.0f} incremental annual revenue.**
-
-*Owner: CRM / Lifecycle · Timeline: 60 days to launch*
-        """)
-
-    with col_r2:
-        st.warning(f"""
-**2 — Scale the {best_cohort_str} Acquisition Playbook**
-
-The {best_cohort_str} cohort retains at **{best_m3:.1f}%** by M3 —
-**{multiplier:.1f}×** the {avg_m3:.1f}% cross-cohort average —
-and delivers £{best_ltv:,.0f} LTV per customer vs. £{avg_ltv:,.0f} average.
-
-These buyers enter with established purchase intent rather than discount response.
-Identify the acquisition channels (organic search, email, direct) that sourced this
-cohort and shift budget toward them ahead of the next holiday season.
-
-*Owner: Growth / Paid Acquisition · Timeline: Q3 planning*
-        """)
-
-    with col_r3:
-        st.success(f"""
-**3 — Shift Budget to Expansion Revenue After M3**
-
-Customers who survive to Month 3 show stable ARPU and represent a disproportionate
-share of total LTV. The marginal cost of retaining an M3 customer is 5–10× lower than
-acquiring a new one.
-
-Redirect 20–30% of performance-marketing spend toward upsell / cross-sell campaigns
-targeting M2–M4 actives: product bundles from StockCode affinity, replenishment
-reminders for consumable SKUs, and a premium membership tier.
-
-**Target:** Net Revenue Retention > 100% for retained cohorts by end of year.
-
-*Owner: Revenue / Product · Timeline: Next quarter*
-        """)
+    if len(m6) >= 2:
+        st.markdown("#### Revenue per acquired customer through M6")
+        st.caption(
+            "Revenue from acquisition month through month 6, divided by the "
+            "original cohort size. Only cohorts with a complete M6 are included."
+        )
+        chart = m6[["cohort_month", "m6_revenue_per_customer"]].set_index(
+            "cohort_month"
+        )
+        st.bar_chart(chart)
+        st.dataframe(
+            m6[["cohort_month", "cohort_size", "m3_retention",
+                "m6_revenue_per_customer"]].rename(columns={
+                    "cohort_month": "Cohort",
+                    "cohort_size": "Customers",
+                    "m3_retention": "M3 retention %",
+                    "m6_revenue_per_customer": "M0–M6 revenue / customer (£)",
+                }),
+            width="stretch",
+            hide_index=True,
+        )
+    else:
+        st.info("M6 revenue comparison needs at least two mature cohorts.")
 
     st.divider()
+    st.markdown("#### Testable recommendation: first-month win-back")
+    if not m1_rows.empty:
+        acquired = m1_rows["cohort_size"].sum()
+        returned = m1_rows["active_users"].sum()
+        m1_rate = 100 * returned / acquired if acquired else 0
+        avg_size = m1_rows["cohort_size"].mean()
+        m1_arpu = (
+            m1_rows["period_revenue"].sum() / returned if returned else 0
+        )
+        assumed_recovery = 0.05
+        lapsed_per_cohort = avg_size * (1 - m1_rate / 100)
+        recovered_per_cohort = lapsed_per_cohort * assumed_recovery
+        annual_scenario = recovered_per_cohort * m1_arpu * 12
+        st.markdown(
+            f"Across {len(m1_rows)} cohorts with an observed M1, "
+            f"**{m1_rate:.1f}%** of acquired customers purchased again in M1. "
+            "A CRM team could test a post-purchase message sequence against a "
+            "holdout group and measure incremental M1 purchases and margin."
+        )
+        st.markdown(
+            f"**Illustrative scenario, not a forecast:** If 5% of customers "
+            f"who did not buy in M1 were induced to make one additional "
+            f"purchase, that is about {recovered_per_cohort:.1f} buyers per "
+            f"average cohort × £{m1_arpu:,.0f} observed revenue per active M1 "
+            f"buyer × 12 cohorts = **£{annual_scenario:,.0f} annual gross "
+            "revenue**. This assumes one new cohort each month, similar "
+            "cohort size and spend, and no cannibalization. It excludes "
+            "campaign cost and margin."
+        )
+    else:
+        st.info("This selection has no cohort with a complete M1.")
 
-    # ── Business Narrative — Part 6 ──────────────────────────────────────────
-    st.markdown("## Business Narrative")
-    st.caption("Interview talking points — structured as Finding / Hypothesis / Recommendation")
-
-    st.markdown(f"""
-**FINDING**
-
-The {best_cohort_str} acquisition cohort retains **{best_m3:.1f}%** of customers by Month 3,
-against a cross-cohort average of **{avg_m3:.1f}%** — that is **{multiplier:.1f}× the baseline**.
-The gap compounds: by Month 12, this cohort accumulates **£{best_row['lifetime_revenue']:,.0f}** in
-total revenue (£{best_ltv:,.0f} per acquired customer), while the median cohort plateaus near
-£{summary_df['ltv_per_customer'].median():,.0f}/customer. No other cohort comes within 40% of
-that LTV figure. This is not a marginal outperformance — it is a structural signal.
-
----
-
-**HYPOTHESIS**
-
-December buyers in UK online gifting retail are disproportionately holiday shoppers or gift-card
-recipients who enter the funnel with explicit purchase intent — not in response to a discount.
-The evidence:
-
-- M1 ARPU for the {best_cohort_str} cohort is **£{best_m1_arpu:,.0f}** per active buyer vs.
-  **£{other_m1_arpu:,.0f}** for all other cohorts — a {int(best_m1_arpu / max(other_m1_arpu, 1) * 100 - 100)}%
-  premium on basket size from day one.
-- Retention *stays* elevated through M6 and M12, not just M1, which rules out a one-time
-  seasonal spike. It is the *quality* of the buyer, not the season alone.
-- High-intent buyers typically have a lower discount sensitivity, making them cheaper to retain
-  and more receptive to value-added upsells.
-
----
-
-**RECOMMENDATION**
-
-The highest-leverage intervention is attacking the **{m1_dropoff:.0f}% Month-1 dropout rate**
-among non-{best_cohort_str} cohorts. This is where the revenue gap opens.
-
-A 30-day win-back email sequence — personalised to the first-purchase category using
-StockCode signals — with a time-limited soft incentive (free shipping, loyalty points) could
-conservatively recover **5% of lapsed buyers**.
-
-Calculation from this dataset:
-
-| Assumption | Value |
-|---|---|
-| Avg non-{best_cohort_str} cohort size | ~{non_best_avg_size} customers |
-| M1 dropoff rate | {m1_dropoff:.0f}% (~{int(non_best_avg_size * m1_dropoff / 100)} customers) |
-| 5% win-back of dropoffs | ~{additional_retained} additional retained |
-| Avg M1 revenue / retained buyer | £{incremental_arpu:,.0f} |
-| New cohorts per year | 12 |
-| **Incremental annual revenue** | **£{annual_revenue_lift:,.0f}** |
-
-At full scale — if non-December cohorts could be lifted even halfway toward the {best_cohort_str}
-retention curve — the recoverable revenue upside exceeds **£200,000 per year**.
-Month-1 churn is the single highest-leverage metric to move.
-    """)
+    st.markdown(
+        "**Next analysis:** Link customers to acquisition channel, product "
+        "mix, and campaign exposure before recommending a budget shift. "
+        "Measure conversion, incremental revenue, and gross margin in an "
+        "experiment rather than inferring the cause from cohort month."
+    )
 
     st.divider()
+    with st.expander("Method and limitations"):
+        st.markdown(
+            "- Cohort = first purchase month within the selected country. "
+            "All Countries uses first purchase across the dataset.\n"
+            "- Retention = customers purchasing in a month divided by "
+            "customers in the acquisition cohort. Zero-purchase months are 0%.\n"
+            f"- The final source month is partial, so the analysis ends "
+            f"with {analysis_cutoff[:7]}. Later months are unobserved, not churn.\n"
+            "- Small cohorts are noisy. These data contain no acquisition "
+            "channel, campaign cost, or experimental assignment.\n"
+            "- M0–M6 revenue per customer is a fixed-window measure, "
+            "not lifetime value."
+        )
 
-    # ── Resume Bullets — Part 7 ───────────────────────────────────────────────
-    with st.expander("Resume Bullets  (copy after tailoring to your role)"):
-        st.code(f"""
-- Engineered cohort retention pipeline in SQL (CTEs, window functions, date spine)
-  on 1M+ transaction records; identified {best_cohort_str} cohort {multiplier:.1f}x retention
-  anomaly vs. {avg_m3:.1f}% baseline across {n_cohorts} monthly cohorts.
+    with st.expander("Resume bullets (tailor to the role)"):
+        st.code(
+            f"Built a Python, SQL, and Streamlit cohort dashboard on "
+            f"{stats['n_rows']:,} cleaned retail line items, with country "
+            f"filtering and retention through the last complete month.\n"
+            f"Used DuckDB CTEs and window functions to compare M3 retention "
+            f"across {len(m3)} eligible cohorts and M0–M6 revenue per "
+            f"acquired customer across {len(m6)} mature cohorts.\n"
+            "Proposed a first-month win-back experiment with transparent "
+            "revenue assumptions and a holdout measurement plan.",
+            language="text",
+        )
 
-- Built interactive Plotly + Streamlit dashboard with cohort heatmap, retention curves,
-  and LTV analysis segmented by country (41 markets) on UCI Online Retail II dataset.
-
-- Translated retention data into 3 business recommendations targeting month-1 churn;
-  estimated 5% retention lift = £{annual_revenue_lift:,.0f} incremental annual revenue
-  based on {additional_retained} additional retained customers x £{incremental_arpu:,.0f} avg M1 ARPU x 12 cohorts/year.
-        """.strip(), language="text")
-
-    st.divider()
-
-    # ── SQL transparency ──────────────────────────────────────────────────────
-    with st.expander("View core cohort SQL  (DuckDB — 6 CTEs + 4 window functions)"):
+    with st.expander("View cohort SQL (DuckDB)"):
         st.code(COHORT_RETENTION_SQL, language="sql")
-
-    with st.expander("View summary + average queries"):
-        st.code(COHORT_SUMMARY_SQL,    language="sql")
+    with st.expander("View summary and average queries"):
+        st.code(COHORT_SUMMARY_SQL, language="sql")
         st.code(AVERAGE_RETENTION_SQL, language="sql")
