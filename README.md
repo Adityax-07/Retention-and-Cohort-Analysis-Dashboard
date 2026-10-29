@@ -15,6 +15,8 @@ An interactive analysis of repeat purchasing in the [UCI Online Retail II datase
 
 The dashboard uses **805,549 cleaned transaction line items** from approximately 1.07 million raw rows. It combines Python data cleaning, SQLite storage, DuckDB cohort SQL, Plotly charts, and Streamlit filters. The default view is United Kingdom. The source covers December 2009 to 9 December 2011; analysis excludes the incomplete December 2011 month.
 
+[Open the live Hugging Face dashboard](https://huggingface.co/spaces/Adityax-07/Retention-and-Cohort-Analysis).
+
 ![United Kingdom cohort retention heatmap](docs/cohort-heatmap.png)
 
 ## What to look at
@@ -45,11 +47,12 @@ The final source month is treated as incomplete unless the last transaction fall
 
 ```bash
 pip install -r requirements.txt
-python ingest_data.py
 streamlit run app.py
 ```
 
-On a fresh Streamlit launch, the app can run ingestion automatically. It downloads the source ZIP from UCI, extracts the workbook, and writes `data/retail.db`. The database and source workbook are ignored by Git; the first run needs internet access and a few minutes. Later runs use the local database.
+On a fresh Streamlit launch, [`snapshot.py`](snapshot.py) extracts the checked-in [compressed database](assets/retail.db.gz) to `data/retail.db` and checks its integrity. This avoids downloading and parsing the Excel workbook during startup. The snapshot contains the cleaned data described below, while the extracted database and source workbook are ignored by Git.
+
+To reproduce the snapshot from the original UCI workbook, run `python ingest_data.py` and then gzip the resulting `data/retail.db`. This full rebuild downloads the source ZIP and can take several minutes.
 
 ## Pipeline
 
@@ -64,7 +67,7 @@ The original raw workbook includes returns, cancellations, missing customer IDs,
 - Small countries can have only one or two customers. The dashboard shows available data but avoids ranking cohorts when fewer than two have an observed M3.
 - M0–M6 revenue per customer is a fixed-window measure, **not lifetime value**. It excludes future purchases and costs.
 - Acquisition channel, marketing exposure, campaign costs, margin, and controlled experiment results are absent. The win-back scenario assumes a 5% recovery of M1 nonbuyers, one extra purchase at observed M1 revenue per active buyer, 12 comparable cohorts a year, and no cannibalization. It is a hypothesis to test.
-- The chart above previews the default UK analysis. Add a live demo link here after deploying the Streamlit app. No public deployment URL is configured in this repository.
+- The chart above previews the default UK analysis. The live dashboard is linked near the top of this README.
 
 ## Tools
 

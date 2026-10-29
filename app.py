@@ -8,7 +8,6 @@ Launch:    streamlit run app.py
 
 import os
 import sqlite3
-import sys
 
 import duckdb
 import pandas as pd
@@ -20,6 +19,7 @@ from cohort_queries import (
     COHORT_RETENTION_SQL,
     COHORT_SUMMARY_SQL,
 )
+from snapshot import restore_database
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "retail.db")
@@ -78,18 +78,17 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── Auto-ingest on first run (Hugging Face Spaces / fresh clone) ───────────────
+# ── Restore the prepared snapshot on first run ────────────────────────────────
 if not os.path.exists(DB_PATH):
-    import subprocess
-    with st.spinner("First run — downloading & processing UCI dataset (~2–3 min)..."):
-        result = subprocess.run(
-            [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ingest_data.py")],
-            capture_output=True,
-            text=True,
-            cwd=os.path.dirname(os.path.abspath(__file__)),
-        )
-    if result.returncode != 0:
-        st.error(f"Data ingestion failed:\n\n```\n{result.stderr[-2000:]}\n```")
+    snapshot_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "assets", "retail.db.gz"
+    )
+    try:
+        with st.spinner("Preparing dashboard data..."):
+            restore_database(snapshot_path, DB_PATH)
+    except (OSError, ValueError) as error:
+        st.error(f"Could not prepare dashboard data: {error}")
+        st.caption("For a local rebuild, run python ingest_data.py.")
         st.stop()
     st.rerun()
 
