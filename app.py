@@ -318,7 +318,7 @@ with tab1:
         raw_pivot = pivot.copy().round(1)
         raw_pivot.columns = [f"M{int(c)}" for c in raw_pivot.columns]
         st.dataframe(
-            raw_pivot.style.background_gradient(cmap="Reds", axis=None).format("{:.1f}", na_rep="—"),
+            raw_pivot,
             width="stretch",
         )
 
@@ -422,10 +422,7 @@ with tab2:
                 })
             )
             st.dataframe(
-                sel_summary.set_index("Cohort").round(1).style.format(
-                    {"M0–M6 Revenue / Customer (£)": "£{:,.0f}", "M1 %": "{:.1f}", "M3 %": "{:.1f}", "M6 %": "{:.1f}"},
-                    na_rep="—",
-                ),
+                sel_summary.set_index("Cohort").round(1),
                 width="stretch",
             )
 
